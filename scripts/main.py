@@ -1,31 +1,34 @@
+import logging
+import random
 from collections import defaultdict
 from functools import partial
+from pathlib import Path
+
 import click
 import torch
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from task_vectors.data import load_data, data_iterator
-from task_vectors.model import load_model, validate_model_size, LlamaModelSize
-from task_vectors.utils import save_results, get_icl_prompt, infer
+from task_vectors.data import Sample, task_factory
+
+from task_vectors.models.utils import model_factory, ModelProcessor, ModelName
+from task_vectors.utils import save_results, get_device
 
 
 def get_task_accuracy(
-    model: AutoModelForCausalLM,
-    tokenizer: AutoTokenizer,
-    task_data: dict,
-    exclude_keys: set[str],
-    device: str,
-    context: str | None = None,
+    model: ModelProcessor,
+    task_data: list[Sample],
+    use_context: bool,
+    context: list[Sample] | None = None,
+    use_img: bool = False,
 ):
+    exclude_input_texts = set([sample.input_text for sample in context]) if context else set()
     total_count = match_count = 0
-    for input_item, target_output in tqdm(
-        data_iterator(task_data, exclude_keys),
-        total=len(task_data) - len(exclude_keys),
+    for sample in tqdm(
+        filter(lambda x: x.input_text not in exclude_input_texts, task_data),
+        total=len(task_data) - len(exclude_input_texts),
     ):
-        prompt = f"\n{context}\n{input_item}" if context else f"\n{input_item}"
-        answer = infer(model, tokenizer, prompt, device)
-        match = target_output.startswith(answer) or answer.startswith(target_output)
+        answer = model(sample, context=context if use_context else None, use_img=use_img)
+        match = sample.target.startswith(answer) or answer.startswith(sample.target)
         match_count += match
         total_count += 1
     return round((match_count / total_count) * 100, 4)
@@ -34,19 +37,18 @@ def get_task_accuracy(
 @click.command()
 @click.option(
     "--model-size",
-    type=click.STRING,
-    callback=validate_model_size,
-    help="Model size must be one of: 1B, 3B, 11B, 90B",
+    type=click.Choice(["Llama-3.2-1B", "Llama-3.2-3B", "Qwen2-VL-2B", "Qwen2-VL-7B"]),
+    help="Model size must be one of: Llama-3.2-1B, Llama-3.2-3B, Qwen2-VL-2B, Qwen2-VL-7B",
 )
 @click.option("--task", type=click.STRING)
 @click.option("--nb-demonstrations", type=click.INT, required=False, default=5)
 @click.option("--nb-runs", type=click.INT, required=False, default=1)
-def main(model_size: LlamaModelSize, task: str, nb_demonstrations: int = 5, nb_runs: int = 1):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    device = "mps" if torch.backends.mps.is_available() else device
+@click.option("--use-img", is_flag=True, default=False)
+def main(model_size: ModelName, task: str, nb_demonstrations: int = 5, nb_runs: int = 1, use_img: bool = False):
+    device = get_device()
 
-    model, tokenizer = load_model(model_size, device)
-    task_data = load_data(task, tokenizer)
+    model = model_factory(model_size, device)
+    task_data = task_factory(task, model.tokenizer)
 
     def hook_extract(
         module: torch.nn.Module,
@@ -65,52 +67,55 @@ def main(model_size: LlamaModelSize, task: str, nb_demonstrations: int = 5, nb_r
         return outputs
 
     results_per_layer = defaultdict(list)
-    for _ in tqdm(range(nb_runs), desc="Runs"):
-        # Use different few-shot data for each run
-        few_shot_prompts, few_shot_data = get_icl_prompt(task_data, nb_demonstrations)
-        exclude_keys = set(few_shot_data.keys())
+    output_filepath = f"results/{model_size}_{task}_{nb_demonstrations}_demos_{nb_runs}_runs.csv"
+    if Path(output_filepath).exists():
+        logging.info(f"Results already exist for {model_size}, {task}, {nb_demonstrations}, {nb_runs}. Exiting.")
+        return
 
+    for _ in tqdm(range(nb_runs), desc=f"Runs for {task}"):
+        # Use different in-context data for each run
+        # create context with additional dummy query
+        context_data: list[Sample] = random.sample(task_data, nb_demonstrations + 1)
         # get baseline standard ICL accuracy
         acc_icl = get_task_accuracy(
             model=model,
-            tokenizer=tokenizer,
             task_data=task_data,
-            exclude_keys=exclude_keys,
-            device=device,
-            context="\n".join(few_shot_prompts),
+            context=context_data[:-1],  # exclude the dummy query
+            use_img=use_img,
+            use_context=True,
         )
         results_per_layer["icl"].append(acc_icl)
         tqdm.write(f"ICL Accuracy: {acc_icl}%")
 
         # get accuracy per layer with task vectors
         for layer_index, layer in tqdm(
-            enumerate(model.model.layers),
+            enumerate(model.model.model.layers),
             desc="Layers",
-            total=len(model.model.layers),
+            total=len(model.model.model.layers),
         ):
             task_vectors = []  # Reset task vectors for each layer
             extract_hook = layer.register_forward_hook(hook_extract)
-            infer(model, tokenizer, prompt="\n".join(few_shot_prompts), device=device)
+            model(context_data[-1], context=context_data[:-1], use_img=use_img)
             extract_hook.remove()
             inject_hook = layer.register_forward_hook(
                 partial(hook_inject, task_vectors=task_vectors[0])
             )
             acc = get_task_accuracy(
                 model=model,
-                tokenizer=tokenizer,
                 task_data=task_data,
-                exclude_keys=exclude_keys,
-                device=device,
+                context=context_data,
+                use_context=False,
             )
             tqdm.write(f"Layer {layer_index} Accuracy: {acc}%")
             results_per_layer[layer_index].append(acc)
             extract_hook.remove()
             inject_hook.remove()
 
-    save_results(
-        results_per_layer,
-        filename=f"{model_size}_{task}_{nb_demonstrations}_demos_{nb_runs}_runs.csv",
-    )
+    if not Path(output_filepath).exists():
+        save_results(
+            results_per_layer,
+            filepath=output_filepath,
+        )
 
 
 if __name__ == "__main__":

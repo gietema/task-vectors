@@ -1,13 +1,16 @@
 import random
+from pathlib import Path
 
 import pandas as pd
+import torch
 
 from task_vectors.constants import SEPARATOR
 
 
-def save_results(results_per_layer: dict, filename: str):
+def save_results(results_per_layer: dict, filepath: str):
+    Path(filepath).parent.mkdir(parents=True, exist_ok=True)
     df = pd.DataFrame(results_per_layer.items(), columns=["layer", "accuracy"])
-    df.to_csv(filename, index=False)
+    df.to_csv(filepath, index=False)
 
 
 def get_icl_prompt(data: dict, nb_shots: int) -> tuple[list[str], dict]:
@@ -22,15 +25,7 @@ def get_icl_prompt(data: dict, nb_shots: int) -> tuple[list[str], dict]:
     return prompts, dict(sampled_items)
 
 
-def infer(model, tokenizer, prompt, device):
-    inputs = tokenizer(
-        prompt, return_tensors="pt", padding=True, return_token_type_ids=False
-    ).to(device)
-    output_ids = model.generate(
-        **inputs,
-        max_new_tokens=1,
-        do_sample=False,
-        num_return_sequences=1,
-        pad_token_id=tokenizer.pad_token_id,
-    )
-    return tokenizer.decode(output_ids[-1][-1], skip_special_tokens=True)
+def get_device() -> str:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "mps" if torch.backends.mps.is_available() else device
+    return device
