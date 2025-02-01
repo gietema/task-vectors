@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Define categories and tasks as separate arrays
-categories=("translation" "linguistic" "knowledge")
+categories=("knowledge")
 translation_tasks=("en_es" "en_fr" "es_en" "fr_en")
 linguistic_tasks=("antonyms" "singular_plural" "present_simple_gerund" "present_simple_past_simple")
 knowledge_tasks=("country_capital" "location_continent" "location_religion" "person_language")
@@ -16,7 +16,7 @@ for category in "${categories[@]}"; do
 
   for task in "${tasks[@]}"; do
     for nb_demonstrations in "${demonstrations[@]}"; do
-      poetry run python scripts/main.py --model-size 1B --task "$category/$task" --nb-runs 2 --nb-demonstrations "$nb_demonstrations"
+      poetry run python scripts/main.py --model-size Llama-3.2-1B --task "text/$category/$task" --nb-runs 5 --nb-demonstrations "$nb_demonstrations"
     done
   done
 done
